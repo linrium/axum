@@ -6,7 +6,7 @@
 //! use axum::{
 //!     Router,
 //!     routing::get,
-//!     response::sse::{Event, KeepAlive, Sse},
+//!     response::sse::{Event, KeepAlive, Sse, EventExt},
 //! };
 //! use std::{time::Duration, convert::Infallible};
 //! use tokio_stream::StreamExt as _ ;
@@ -14,7 +14,7 @@
 //!
 //! let app = Router::new().route("/sse", get(sse_handler));
 //!
-//! async fn sse_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+//! async fn sse_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>, Event> {
 //!     // A `Stream` that repeats an event every second
 //!     let stream = stream::repeat_with(|| Event::default().data("hi!"))
 //!         .map(Ok)
@@ -47,30 +47,33 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use std::marker::PhantomData;
 use sync_wrapper::SyncWrapper;
 use tokio::time::Sleep;
 
 /// An SSE response
 #[derive(Clone)]
 #[must_use]
-pub struct Sse<S> {
+pub struct Sse<S, T> {
     stream: S,
     keep_alive: Option<KeepAlive>,
+    _phantom: PhantomData<T>,
 }
 
-impl<S> Sse<S> {
+impl<S, T> Sse<S, T> {
     /// Create a new [`Sse`] response that will respond with the given stream of
     /// [`Event`]s.
     ///
     /// See the [module docs](self) for more details.
     pub fn new(stream: S) -> Self
     where
-        S: TryStream<Ok = Event> + Send + 'static,
+        S: TryStream<Ok = T> + Send + 'static,
         S::Error: Into<BoxError>,
     {
         Sse {
             stream,
             keep_alive: None,
+            _phantom: PhantomData,
         }
     }
 
@@ -83,7 +86,7 @@ impl<S> Sse<S> {
     }
 }
 
-impl<S> fmt::Debug for Sse<S> {
+impl<S, T> fmt::Debug for Sse<S, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sse")
             .field("stream", &format_args!("{}", std::any::type_name::<S>()))
@@ -92,10 +95,11 @@ impl<S> fmt::Debug for Sse<S> {
     }
 }
 
-impl<S, E> IntoResponse for Sse<S>
+impl<S, E, T> IntoResponse for Sse<S, T>
 where
-    S: Stream<Item = Result<Event, E>> + Send + 'static,
+    S: Stream<Item = Result<T, E>> + Send + 'static,
     E: Into<BoxError>,
+    T: EventExt,
 {
     fn into_response(self) -> Response {
         (
@@ -121,9 +125,10 @@ pin_project! {
     }
 }
 
-impl<S, E> HttpBody for SseBody<S>
+impl<S, E, T> HttpBody for SseBody<S>
 where
-    S: Stream<Item = Result<Event, E>>,
+    S: Stream<Item = Result<T, E>>,
+    T: EventExt
 {
     type Data = Bytes;
     type Error = E;
@@ -154,6 +159,14 @@ where
     }
 }
 
+pub trait EventExt {
+    fn data<T>(mut self, data: T) -> Self
+    where
+        T: AsRef<str>;
+
+    fn finalize(self) -> Bytes;
+}
+
 /// Server-sent event
 #[derive(Debug, Default, Clone)]
 #[must_use]
@@ -162,7 +175,7 @@ pub struct Event {
     flags: EventFlags,
 }
 
-impl Event {
+impl EventExt for Event {
     /// Set the event's data data field(s) (`data: <content>`)
     ///
     /// Newlines in `data` will automatically be broken across `data: ` fields.
@@ -177,9 +190,9 @@ impl Event {
     /// - Panics if `data` or `json_data` have already been called.
     ///
     /// [`MessageEvent`'s data field]: https://developer.mozilla.org/en-US/docs/Web/API/MessageEvent/data
-    pub fn data<T>(mut self, data: T) -> Event
-    where
-        T: AsRef<str>,
+    fn data<T>(mut self, data: T) -> Event
+        where
+            T: AsRef<str>,
     {
         if self.flags.contains(EventFlags::HAS_DATA) {
             panic!("Called `EventBuilder::data` multiple times");
@@ -194,6 +207,13 @@ impl Event {
         self
     }
 
+    fn finalize(mut self) -> Bytes {
+        self.buffer.put_u8(b'\n');
+        self.buffer.freeze()
+    }
+}
+
+impl Event {
     /// Set the event's data field to a value serialized as unformatted JSON (`data: <content>`).
     ///
     /// This corresponds to [`MessageEvent`'s data field].
@@ -353,11 +373,6 @@ impl Event {
         self.buffer.put_u8(b' ');
         self.buffer.extend_from_slice(value);
         self.buffer.put_u8(b'\n');
-    }
-
-    fn finalize(mut self) -> Bytes {
-        self.buffer.put_u8(b'\n');
-        self.buffer.freeze()
     }
 }
 
